@@ -1,14 +1,29 @@
-import logging
-import anyio
+"""WebSocket transport that lets Home Assistant act as an MCP server for Xiaozhi.
+
+Adapted for Home Assistant 2026.11 / MCP SDK 2.x.
+"""
+
+from __future__ import annotations
+
 import asyncio
+import dataclasses
+import logging
+import re
+from typing import Any
+
 import aiohttp
-from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
+import anyio
 from mcp import types
-from mcp.shared.message import SessionMessage
+from pydantic import TypeAdapter
+
+try:  # MCP 1.x and (most likely) 2.x
+    from mcp.shared.message import SessionMessage
+except ImportError:  # pragma: no cover - defensive fallback
+    SessionMessage = None  # type: ignore[assignment,misc]
 
 from homeassistant.components import conversation
 from homeassistant.const import CONF_LLM_HASS_API
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import Context, HomeAssistant
 from homeassistant.helpers import llm
 
 from .const import DOMAIN
@@ -18,54 +33,96 @@ from .types import WsMCPServerConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
+# JSONRPCMessage is a union type in MCP 2.x, so validate through a TypeAdapter.
+_JSONRPC_ADAPTER: TypeAdapter[Any] = TypeAdapter(types.JSONRPCMessage)
 
-async def async_setup_entry(hass: HomeAssistant,  entry: WsMCPServerConfigEntry) -> bool:
-    """Set up MCP Server from a config entry."""
-    hass.async_create_task(_connect_loop(hass, entry))
-    #hass.async_create_task(_connect_to_client(hass, entry))
-    return True
+RECONNECT_MIN_DELAY = 20
+RECONNECT_MAX_DELAY = 120
 
-def async_get_config_entry(hass: HomeAssistant) -> WsMCPServerConfigEntry:
-    """Get the first enabled MCP server config entry."""
-    config_entries: list[WsMCPServerConfigEntry] = (
-        hass.config_entries.async_loaded_entries(DOMAIN)
+_TOKEN_RE = re.compile(r"(token=)[^&\s]+", re.IGNORECASE)
+
+
+def _redact(endpoint: str) -> str:
+    """Hide the access token of the Xiaozhi endpoint before logging it."""
+    return _TOKEN_RE.sub(r"\1***", endpoint)
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: WsMCPServerConfigEntry) -> bool:
+    """Start the reconnect loop for a config entry."""
+    # Background tasks created through the entry are cancelled on unload.
+    entry.async_create_background_task(
+        hass, _connect_loop(hass, entry), f"{DOMAIN}_{entry.entry_id}_connect_loop"
     )
-    if not config_entries:
-        raise RuntimeError("Model Context Protocol server is not configured")
-    if len(config_entries) > 1:
-        raise RuntimeError("Found multiple Model Context Protocol configurations")
-    return config_entries[0]
+    return True
 
 
 async def _connect_loop(hass: HomeAssistant, entry: WsMCPServerConfigEntry) -> None:
     """Reconnect on failure loop."""
+    delay = RECONNECT_MIN_DELAY
     while True:
+        started = hass.loop.time()
         try:
-            _LOGGER.info("mcp websocket.py loop")
-            if await _connect_to_client(hass, entry) == False:
+            _LOGGER.info("mcp websocket loop")
+            if await _connect_to_client(hass, entry) is False:
                 break
-        except Exception as e:
-            _LOGGER.warning("mcp WebSocket disconnected or failed: %s", e)
-        _LOGGER.info("mcp websocket.py retry after 20 seconds")
-        await asyncio.sleep(20)  # 20秒后重连
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("mcp WebSocket disconnected or failed: %s", err)
+        # A connection that lived for a while resets the back-off.
+        if hass.loop.time() - started > 60:
+            delay = RECONNECT_MIN_DELAY
+        _LOGGER.info("mcp websocket retry after %s seconds", delay)
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, RECONNECT_MAX_DELAY)
 
-async def _connect_to_client(hass: HomeAssistant, entry: WsMCPServerConfigEntry) -> None:
-    """Connect to external WebSocket endpoint as MCP server."""
-    #entry = async_get_config_entry(hass)
-    session_manager = entry.runtime_data
+
+async def _build_ha_context(hass: HomeAssistant) -> Context:
+    """Return a real Home Assistant Context that carries an administrator user.
+
+    HA 2026.11 validates the LLM context and some tools require an admin user.
+    """
+    user_id: str | None = None
+    try:
+        users = await hass.auth.async_get_users()
+        candidates = [
+            user
+            for user in users
+            if user.is_active and not user.system_generated and user.is_admin
+        ]
+        candidates.sort(key=lambda user: not user.is_owner)
+        if candidates:
+            user_id = candidates[0].id
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.warning("mcp could not look up an admin user: %s", err)
+    return Context(user_id=user_id)
+
+
+def _build_llm_context(ha_context: Context) -> llm.LLMContext:
+    """Create the LLMContext in a way that tolerates signature changes."""
+    kwargs: dict[str, Any] = {
+        "platform": DOMAIN,
+        "context": ha_context,
+        "language": "*",
+        "assistant": conversation.DOMAIN,
+        "device_id": None,
+    }
+    if dataclasses.is_dataclass(llm.LLMContext):
+        field_names = {field.name for field in dataclasses.fields(llm.LLMContext)}
+        if "requires_admin" in field_names:
+            kwargs["requires_admin"] = True
+    return llm.LLMContext(**kwargs)
+
+
+async def _connect_to_client(hass: HomeAssistant, entry: WsMCPServerConfigEntry) -> bool:
+    """Connect to the Xiaozhi WebSocket endpoint and serve MCP over it."""
+    session_manager = hass.data[DOMAIN][entry.entry_id]["session_manager"]
     endpoint = entry.data.get("client_endpoint")
     if not endpoint:
         _LOGGER.error("No client endpoint configured in config entry")
         return False
 
-    _LOGGER.info("mcp websocket.py _connect_to_client")
-    context = llm.LLMContext(
-        platform=DOMAIN,
-        context={},  # Could be extended
-        language="*",
-        assistant=conversation.DOMAIN,
-        device_id=None,
-    )
+    context = _build_llm_context(await _build_ha_context(hass))
     llm_api_id = entry.data[CONF_LLM_HASS_API]
     _LOGGER.info("mcp llm_api_id: %s", llm_api_id)
     server = await create_server(hass, llm_api_id, context, read_only=False)
@@ -73,60 +130,72 @@ async def _connect_to_client(hass: HomeAssistant, entry: WsMCPServerConfigEntry)
 
     read_stream_writer, read_stream = anyio.create_memory_object_stream(0)
     write_stream, write_stream_reader = anyio.create_memory_object_stream(0)
-    
-    bReConnect = True
-    async with session_manager.create(Session(read_stream_writer)) as session_id:
-        _LOGGER.info("mcp Connecting to MCP client at: %s", endpoint)
+
+    reconnect = True
+    async with session_manager.create(Session(read_stream_writer)):
+        _LOGGER.info("mcp Connecting to MCP client at: %s", _redact(endpoint))
         timeout = aiohttp.ClientTimeout(total=60)
         async with aiohttp.ClientSession(timeout=timeout) as client_session:
             try:
                 async with client_session.ws_connect(endpoint) as ws:
-                    async def ws_reader():
+
+                    async def ws_reader() -> None:
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 try:
-                                    json_data = msg.json()
-                                    message = types.JSONRPCMessage.model_validate(json_data)
-                                    #_LOGGER.info("mcp reader: %s", message)
-                                    #await read_stream_writer.send(message)
-                                    session_message = SessionMessage(message)
-                                    _LOGGER.info("mcp reader: %s", session_message)
-                                    await read_stream_writer.send(session_message)
-                                except Exception as err:
-                                    _LOGGER.error("mcp Invalid message from client: %s", err)
+                                    message = _JSONRPC_ADAPTER.validate_python(
+                                        msg.json()
+                                    )
+                                    _LOGGER.debug("mcp reader: %s", message)
+                                    if SessionMessage is not None:
+                                        message = SessionMessage(message)
+                                    await read_stream_writer.send(message)
+                                except Exception as err:  # noqa: BLE001
+                                    _LOGGER.error(
+                                        "mcp Invalid message from client: %s", err
+                                    )
                             elif msg.type == aiohttp.WSMsgType.CLOSE:
                                 _LOGGER.error("mcp WebSocket closed: %s", msg.extra)
                             elif msg.type == aiohttp.WSMsgType.ERROR:
                                 _LOGGER.error("mcp WebSocket error: %s", msg.data)
                         _LOGGER.info("websocket was closed")
-                        tg.cancel_scope.cancel()  #立即取消任务组,避免50秒的心跳等待
-                    async def ws_writer():
-                        #async for message in write_stream_reader:
-                        #    _LOGGER.info("mcp writer: %s", message)
-                        #    await ws.send_str(message.model_dump_json(by_alias=True, exclude_none=True))
-                        async for session_message in write_stream_reader:
-                            _LOGGER.info("mcp writer: %s", session_message)
-                            # 从 SessionMessage 中提取实际的 JSONRPCMessage
-                            actual_message = session_message.message
-                            await ws.send_str(actual_message.model_dump_json(by_alias=True, exclude_none=True))
+                        # Cancel the group right away instead of waiting for the heartbeat.
+                        tg.cancel_scope.cancel()
+
+                    async def ws_writer() -> None:
+                        nonlocal reconnect
+                        async for item in write_stream_reader:
+                            _LOGGER.debug("mcp writer: %s", item)
+                            actual_message = getattr(item, "message", item)
+                            await ws.send_str(
+                                actual_message.model_dump_json(
+                                    by_alias=True, exclude_none=True
+                                )
+                            )
                         _LOGGER.info("disconnect websocket")
-                        nonlocal bReConnect
-                        bReConnect = False
-                        await ws.close()  #断开旧websocket连接
-                    async def heartbeat():
+                        reconnect = False
+                        await ws.close()
+
+                    async def heartbeat() -> None:
                         while True:
                             try:
                                 await asyncio.sleep(50)
-                                _LOGGER.info("mcp heartbeat")
+                                _LOGGER.debug("mcp heartbeat")
                                 await ws.ping()
-                            except Exception as e:
-                                _LOGGER.info("mcp heartbeat ping failed: %s", e)
-                                break  # 主动退出 heartbeat，让整个连接关闭并重连
+                            except Exception as err:  # noqa: BLE001
+                                _LOGGER.info("mcp heartbeat ping failed: %s", err)
+                                break  # close the connection so that it reconnects
+
                     async with anyio.create_task_group() as tg:
                         tg.start_soon(ws_reader)
                         tg.start_soon(ws_writer)
                         tg.start_soon(heartbeat)
                         await server.run(read_stream, write_stream, options)
-            except Exception as e:
-                _LOGGER.exception("mcp Failed to connect to client WebSocket at %s: %s", endpoint, e)
-    return bReConnect
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error(
+                    "mcp Failed to connect to client WebSocket at %s: %s",
+                    _redact(endpoint),
+                    _redact(str(err)),
+                )
+                _LOGGER.debug("mcp connection error details", exc_info=True)
+    return reconnect

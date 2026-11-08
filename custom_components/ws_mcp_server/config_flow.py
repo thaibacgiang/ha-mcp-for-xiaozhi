@@ -1,3 +1,5 @@
+import inspect
+
 import voluptuous as vol
 from typing import Any
 import logging
@@ -35,10 +37,11 @@ class WsMCPServerConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Handle the initial step."""
         errors: dict[str, str] = {}
-        _LOGGER.debug("mcp  LLM APIs available: %s",  llm.async_get_apis(self.hass))
-        
-        llm_apis = {api.id: api.name for api in llm.async_get_apis(self.hass)}
-        #llm_apis = {api.id: api.name for api in await llm.async_get_apis(self.hass)}
+        apis = llm.async_get_apis(self.hass)
+        if inspect.isawaitable(apis):  # tolerate a future async signature
+            apis = await apis
+        _LOGGER.debug("mcp  LLM APIs available: %s", apis)
+        llm_apis = {api.id: api.name for api in apis}
         if user_input is not None:
             # 为每个配置创建唯一标识
             title = f"{user_input[CONF_LLM_HASS_API]}"
